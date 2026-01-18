@@ -1,20 +1,18 @@
 import os
-import requests
-import socket
 import json
+import time
+import uuid
+import socket
+import requests
 from ddgs import DDGS
 from dotenv import load_dotenv
 
 load_dotenv()
 
 class GoveeController:
-    URL = "https://developer-api.govee.com/v1/devices/control"
     API_KEY = os.getenv("GOVEE_API_KEY")
+    BASE_URL = "https://openapi.api.govee.com"
     
-    # LAN Settings for Ceiling Light
-    CEILING_IP = os.getenv("CEILING_IP")
-    UDP_PORT = 4003
-
     # Centralized Device Configuration
     DEVICES = {
         "AMBIENT LAMP 1": (os.getenv("ID_AMBIENT_1"), os.getenv("GOVEE_BULB_MODEL")),
@@ -26,117 +24,76 @@ class GoveeController:
     }
 
     @staticmethod
-    def _control_lan(state: bool) -> bool:
-        if not GoveeController.CEILING_IP:
-            return False
-
-        # 1. Turn command
-        cmd_payload = {
-            "msg": {
-                "cmd": "turn",
-                "data": {"value": 1 if state else 0}
-            }
-        }
+    def set_light(state: bool, target_string: str) -> bool:
+        """
+        Sets the light power state for a specific device or ALL devices.
+        :param state: True for 'on', False for 'off'
+        :param target_string: Key from the DEVICES dictionary or 'ALL'
+        :return: Boolean indicating if all operations were successful
+        """
+        target_upper = target_string.upper()
         
-        # 2. Status query (sometimes wakes up a frozen listener)
-        status_payload = {
-            "msg": {
-                "cmd": "devStatus",
-                "data": {}
-            }
-        }
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(1.0)
-        address = (GoveeController.CEILING_IP, GoveeController.UDP_PORT)
-
-        try:
-            # Send the command
-            sock.sendto(json.dumps(cmd_payload).encode(), address)
-            
-            # IMMEDIATELY follow up with a status query. 
-            # This forces the device to process the buffer to reply.
-            sock.sendto(json.dumps(status_payload).encode(), address)
-            
-            print(f"[GOVEE] LAN Command sent: {'ON' if state else 'OFF'}")
-            return True
-        except Exception as e:
-            print(f"[GOVEE LAN ERROR] {e}")
+        # Determine which devices to control
+        if target_upper == "ALL":
+            targets = list(GoveeController.DEVICES.keys())
+        elif target_upper in GoveeController.DEVICES:
+            targets = [target_upper]
+        else:
+            print(f"Device '{target_string}' not found.")
             return False
-        finally:
-            sock.close()
+
+        overall_success = True
+        
+        for device_key in targets:
+            device_id, sku = GoveeController.DEVICES[device_key]
+            
+            if not device_id or not sku:
+                print(f"Skipping {device_key}: Missing ID or SKU in .env")
+                overall_success = False
+                continue
+
+            success = GoveeController._send_command(device_id, sku, state)
+            if not success:
+                overall_success = False
+            
+            # If controlling ALL, a tiny sleep helps avoid rate limit bursts
+            if target_upper == "ALL":
+                time.sleep(0.1)
+
+        return overall_success
 
     @staticmethod
-    def set_light(state: bool, target_string: str) -> bool:
-        if not GoveeController.API_KEY:
-            return False
-
-        # Clean the input string
-        raw_target = target_string.strip().upper()
-        
-        # Handle "ALL" variations (e.g., "ALL LIGHTS", "ALL")
-        if "ALL" in raw_target:
-            requested_targets = ["ALL"]
-        else:
-            requested_targets = [t.strip() for t in raw_target.split(",")]
-        
-        targets_to_act_on = []
-
-        if "ALL" in requested_targets:
-            # Control bulbs via Cloud
-            cloud_targets = {k: v for k, v in GoveeController.DEVICES.items() if k != "CEILING LIGHT"}
-            targets_to_act_on = list(cloud_targets.values())
-            # Control Ceiling via LAN
-            GoveeController._control_lan(state)
-        else:
-            for name in requested_targets:
-                # Direct check for Ceiling
-                if "CEILING" in name:
-                    GoveeController._control_lan(state)
-                    continue
-                
-                device_info = GoveeController.DEVICES.get(name)
-                if device_info:
-                    targets_to_act_on.append(device_info)
-                else:
-                    # Final attempt: partial match (e.g. "AMBIENT LAMP 1" vs "AMBIENT LAMP 1 LIGHT")
-                    found_partial = False
-                    for dev_name, info in GoveeController.DEVICES.items():
-                        if dev_name in name:
-                            targets_to_act_on.append(info)
-                            found_partial = True
-                            break
-                    if not found_partial:
-                        print(f"[GOVEE] Device not recognized: {name}")
-
-        if not targets_to_act_on:
-            return True # Could be true if only Ceiling was targeted
-
-        # Execute Cloud API calls for bulbs
-        success = True
+    def _send_command(device_id: str, sku: str, state: bool) -> bool:
+        """Internal helper to send the POST request."""
+        endpoint = f"{GoveeController.BASE_URL}/router/api/v1/device/control"
         headers = {
-            "Govee-API-Key": GoveeController.API_KEY,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Govee-API-Key": GoveeController.API_KEY
+        }
+        payload = {
+            "requestId": str(uuid.uuid4()),
+            "payload": {
+                "sku": sku,
+                "device": device_id,
+                "capability": {
+                    "type": "devices.capabilities.on_off",
+                    "instance": "powerSwitch",
+                    "value": 1 if state else 0
+                }
+            }
         }
 
-        for device_id, model in targets_to_act_on:
-            if not device_id or not model:
-                continue
-            
-            payload = {
-                "device": device_id,
-                "model": model,
-                "cmd": {"name": "turn", "value": "on" if state else "off"}
-            }
-            try:
-                resp = requests.put(GoveeController.URL, headers=headers, json=payload, timeout=5)
-                if resp.status_code != 200:
-                    print(f"[GOVEE CLOUD ERROR] {resp.text}")
-                    success = False
-            except Exception as e:
-                print(f"[GOVEE CLOUD ERROR] {e}")
-                success = False
-        return success
+        try:
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=10)
+            data = response.json()
+            if data.get("code") == 200:
+                return True
+            else:
+                print(f"API Error for {device_id}: {data.get('message')}")
+                return False
+        except Exception as e:
+            print(f"Request failed for {device_id}: {e}")
+            return False
 
 def web_search(query: str) -> str:
     query = query.strip('"').strip("'")
