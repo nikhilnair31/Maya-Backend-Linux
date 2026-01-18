@@ -27,22 +27,38 @@ class GoveeController:
 
     @staticmethod
     def _control_lan(state: bool) -> bool:
-        """Helper to control the Ceiling Light via UDP LAN API"""
         if not GoveeController.CEILING_IP:
-            print("[GOVEE] Ceiling IP not set in .env")
             return False
-        
-        payload = {
+
+        # 1. Turn command
+        cmd_payload = {
             "msg": {
                 "cmd": "turn",
                 "data": {"value": 1 if state else 0}
             }
         }
         
+        # 2. Status query (sometimes wakes up a frozen listener)
+        status_payload = {
+            "msg": {
+                "cmd": "devStatus",
+                "data": {}
+            }
+        }
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(1.0)
+        address = (GoveeController.CEILING_IP, GoveeController.UDP_PORT)
+
         try:
-            sock.sendto(json.dumps(payload).encode(), (GoveeController.CEILING_IP, GoveeController.UDP_PORT))
-            print(f"[GOVEE] LAN Command sent to Ceiling Light: {'ON' if state else 'OFF'}")
+            # Send the command
+            sock.sendto(json.dumps(cmd_payload).encode(), address)
+            
+            # IMMEDIATELY follow up with a status query. 
+            # This forces the device to process the buffer to reply.
+            sock.sendto(json.dumps(status_payload).encode(), address)
+            
+            print(f"[GOVEE] LAN Command sent: {'ON' if state else 'OFF'}")
             return True
         except Exception as e:
             print(f"[GOVEE LAN ERROR] {e}")
