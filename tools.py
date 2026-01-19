@@ -4,10 +4,82 @@ import time
 import uuid
 import socket
 import requests
+import subprocess
 from ddgs import DDGS
 from dotenv import load_dotenv
 
 load_dotenv()
+
+class PresenceScanner:
+    @staticmethod
+    def is_user_home():
+        PHONE_NAME = os.getenv("PHONE_NAME")
+        print(f"\n[DEBUG] Starting presence check for {PHONE_NAME}...")
+
+        # --- METHOD A: TAILSCALE CHECK ---
+        try:
+            print(f"[DEBUG] Checking Tailscale status via CLI...")
+            result = subprocess.run(
+                ["tailscale", "status", "--json"],
+                capture_output=True, text=True, timeout=5
+            )
+            
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                peers = data.get("Peer", {})
+                found_in_ts = False
+
+                for peer_id, info in peers.items():
+                    dns_name = info.get("DNSName", "").lower()
+                    if PHONE_NAME.lower() in dns_name:
+                        found_in_ts = True
+                        online = info.get("Online", False)
+                        relay = info.get("Relay", "")
+                        cur_addr = info.get("CurAddr", "N/A")
+                        
+                        print(f"[DEBUG] Tailscale Match: {dns_name}")
+                        print(f"[DEBUG] - Online: {online}")
+                        print(f"[DEBUG] - Relay: '{relay}' (Empty means direct/local)")
+                        print(f"[DEBUG] - CurAddr: {cur_addr}")
+
+                        # If online and NOT relayed, user is home
+                        if online:
+                            # If the current address is a local one, it's an immediate 'Home'
+                            if "192.168.1." in cur_addr:
+                                print(f"[PRESENCE] Home via Tailscale Local IP ({cur_addr})")
+                                return True
+                        elif online and relay == "":
+                            print("[PRESENCE] Home via Tailscale (Direct)")
+                            return True
+                        elif online and relay != "":
+                            print("[DEBUG] Device is Online but Relayed (Away)")
+                
+                if not found_in_ts:
+                    print(f"[DEBUG] Device '{PHONE_NAME}' not found in Tailscale peer list.")
+            else:
+                print(f"[DEBUG] Tailscale CLI returned error code: {result.returncode}")
+        except Exception as e:
+            print(f"[DEBUG] Tailscale check error: {e}")
+
+        # --- METHOD B: LOCAL ARPING FALLBACK ---
+        PHONE_STATIC_IP = os.getenv("PHONE_STATIC_IP")
+        print(f"[DEBUG] Falling back to ARPING for {PHONE_STATIC_IP}...")
+        try:
+            # -c 1 = 1 packet, -w 1 = 1 second timeout
+            # We use the 'arping' command which is better at waking up sleeping mobile devices
+            arping_cmd = ["sudo", "arping", "-c", "1", "-w", "1", PHONE_STATIC_IP]
+            arping_result = subprocess.run(arping_cmd, capture_output=True)
+            
+            if arping_result.returncode == 0:
+                print(f"[PRESENCE] Home via Local ARPING ({PHONE_STATIC_IP})")
+                return True
+            else:
+                print(f"[DEBUG] ARPING to {PHONE_STATIC_IP} failed.")
+        except Exception as e:
+            print(f"[DEBUG] ARPING command error: {e}")
+
+        print("[PRESENCE] User appears to be AWAY.")
+        return False
 
 class GoveeController:
     API_KEY = os.getenv("GOVEE_API_KEY")
