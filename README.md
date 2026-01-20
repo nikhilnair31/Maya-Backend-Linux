@@ -9,7 +9,6 @@
 - Add ability to set timers
 - Add prescence in room check
 - Add routines
-- Add weather tool
 
 ## Tests
 ### Speed Test
@@ -27,5 +26,7 @@
     - Maya: <5s
 
 ## Done
+- Add light brightness control
+- Add weather tool
 - Add user profile
 - Add prescence in home check

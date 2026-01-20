@@ -9,13 +9,13 @@ import shutil
 import asyncio
 import requests
 import edge_tts
-from datetime import datetime
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from transformers import pipeline
+from datetime import datetime, timedelta
 from fastapi.responses import FileResponse
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from tools import WebSearcher, GoveeController, PresenceScanner
+from tools import WeatherManager, WebSearcher, LightsController, PresenceScanner
 
 # Configuration
 load_dotenv()
@@ -99,14 +99,40 @@ async def process_input(
     else:
         raise HTTPException(status_code=400, detail="No input")
     
-    # 1. Get user data
-    # Run this now so we can use it in Step 3 and Step 4
+    # 1. GATHER ALL CONTEXT (Always happens)
     is_home = PresenceScanner.is_user_home()
-    # Dynamically build profile string from ANY keys in the JSON
+    
+    # Date/Weather Context Extraction
+    date_extraction_prompt = (
+        f"Current Date: {datetime.now().strftime('%Y-%m-%d')}\n"
+        f"User said: '{prompt}'\n"
+        f"If the user is asking about weather for a specific time, output YYYY-MM-DD. Otherwise 'TODAY'."
+    )
+    try:
+        extracted_date = requests.post(OLLAMA_ENDPOINT, json={
+            "model": MODEL_NAME, "prompt": date_extraction_prompt, "stream": False, "options": {"temperature": 0}
+        }).json().get("response", "").strip()
+    except:
+        extracted_date = "TODAY"
+    
+    target_date = None if "TODAY" in extracted_date.upper() else extracted_date
+    weather_info = WeatherManager.get_summary(target_date)
+
+    # Build a comprehensive System Identity
     profile_parts = [f"{k.capitalize()}: {v}" for k, v in USER_PROFILE.items() if v]
-    profile_parts.append(f"Current Status: {'At Home' if is_home else 'Away'}")
     profile_summary = " | ".join(profile_parts)
-    # Chat history stuff
+    presence_str = "User is currently at home." if is_home else "User is currently away."
+    
+    system_identity = (
+        f"You are Maya, a helpful smart home AI.\n"
+        f"User Profile: {profile_summary}\n"
+        f"User Presence: {presence_str}\n"
+        f"Weather/Environment: {weather_info}\n"
+        f"Current Time: {datetime.now().strftime('%H:%M')}\n"
+        f"Style: {USER_PROFILE.get('preferences', 'Concise and friendly')}\n"
+    )
+
+    # Update Chat History
     chat_history.append(f"User: {prompt}")
     chat_history = chat_history[-6:]
     history_context = "\n".join(chat_history)
@@ -140,22 +166,23 @@ async def process_input(
     context = ""
     if "LIGHT_COMMAND" in cat_resp:
         # Optimal Router Prompt for Qwen 2.5 3B
-        devices_list = ", ".join(GoveeController.DEVICES.keys())
+        devices_list = ", ".join(LightsController.DEVICES.keys())
 
         decision_prompt = f"""<|im_start|>system
             You are a home automation validator. 
-            Your goal: Determine if the user wants to CHANGE the state of lights.
+            Goal: Determine if the user wants to CHANGE power or brightness.
 
             # Rules:
-            1. If the user is just describing how things look (e.g., "the lights are dim", "it is dark"), output "NO_ACTION".
-            2. If the user gives a command (e.g., "lights on", "turn them off"), output the JSON.
-            3. Available targets: {devices_list}, ALL.
+            1. Use "action": "OFF" for commands like "turn off", "shutdown", "lights out", or "go dark".
+            2. Use "action": "ON" for "turn on", "dim to", "set to", or brightness changes.
+            3. If the user describes a state (e.g., "it is dark in here"), output "NO_ACTION".
+            4. Available targets: {devices_list}, ALL.
 
             # Examples:
             User: "Turn on the kitchen" -> {{"action": "ON", "target": "KITCHEN LIGHT 1"}}
-            User: "It's too bright in here" -> {{"action": "OFF", "target": "ALL"}}
-            User: "The lights are dim" -> NO_ACTION
-            User: "My eyes are tired" -> NO_ACTION
+            User: "all lights off" -> {{"action": "OFF", "target": "ALL"}}
+            User: "Dim everything to 20%" -> {{"action": "ON", "brightness": 20, "target": "ALL"}}
+            User: "standing lamp off" -> {{"action": "OFF", "target": "STANDING LAMP"}}
             <|im_end|>
             <|im_start|>user
             {prompt}
@@ -199,12 +226,20 @@ async def process_input(
                         
                     action_str = params.get("action", "OFF").upper()
                     target = params.get("target", "ALL").upper()
+                    brightness_val = params.get("brightness") # May be None
 
-                    # 3. Execution
                     action_bool = (action_str == "ON")
-                    print(f"[ACTION] Triggering Govee: {action_str} for {target}")
-                    success = GoveeController.set_light(action_bool, target)
-                    context = f"SUCCESS: {target} turned {action_str}"
+                    
+                    # Pass brightness to the controller
+                    success = LightsController.set_light(action_bool, target, brightness=brightness_val)
+                    
+                    if success:
+                        if brightness_val:
+                            context = f"SUCCESS: {target} set to {brightness_val}% brightness"
+                        else:
+                            context = f"SUCCESS: {target} turned {action_str}"
+                    else:
+                        context = "FAILED: I couldn't reach the lights."
                     
                 except Exception as e:
                     print(f"[ERROR] Parsing failed: {e}")
@@ -252,9 +287,10 @@ async def process_input(
 
         # 2. Define Persona using the dynamic summary
         system_rules = (
-            f"Role: You are Maya, a smart home assistant. "
-            f"User Context: {profile_summary}. "
-            f"Persona Style: {USER_PROFILE.get('preferences', 'Concise')}. "
+            f"Role: You are Maya, a smart home assistant."
+            f"User Profile Summary: {profile_summary}."
+            f"Weather Outside: {weather_info}."
+            f"Persona Style: {USER_PROFILE.get('preferences', 'Concise')}."
             f"Instruction: Address the user as {USER_PROFILE.get('nickname', 'User')}."
         )
         
