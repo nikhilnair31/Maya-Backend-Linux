@@ -10,7 +10,6 @@
 - Add prescence in room check
 - Add routines
 - Add weather tool
-- Add user profile
 
 ## Tests
 ### Speed Test
@@ -28,4 +27,5 @@
     - Maya: <5s
 
 ## Done
+- Add user profile
 - Add prescence in home check

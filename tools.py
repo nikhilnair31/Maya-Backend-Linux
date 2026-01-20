@@ -1,3 +1,5 @@
+# tools.py
+
 import os
 import json
 import time
@@ -167,6 +169,39 @@ class GoveeController:
             print(f"Request failed for {device_id}: {e}")
             return False
 
+class WebSearcher:
+    """Handles web searching via DuckDuckGo."""
+    
+    @staticmethod
+    def search(query: str, max_results: int = 3) -> str:
+        """
+        Performs a text search and returns a formatted string of results.
+        """
+        query = query.strip('"').strip("'")
+        print(f"[SEARCH] Querying DuckDuckGo: {query}")
+        
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=max_results))
+            
+            if not results:
+                print("[SEARCH] No results found.")
+                return "No results found for this query."
+
+            # Log results for debugging
+            for i, r in enumerate(results):
+                content_preview = r['body'][:30].replace('\n', ' ')
+                print(f"[SEARCH] Result {i+1}: {r['title']} | {content_preview}...")
+            
+            # Format results for the LLM context
+            formatted_results = "\n".join(
+                [f"Source: {r['title']}\nContent: {r['body']}" for r in results]
+            )
+            return formatted_results
+
+        except Exception as e:
+            print(f"[SEARCH ERROR] {str(e)}")
+            return f"Search Error: {str(e)}"
 def web_search(query: str) -> str:
     query = query.strip('"').strip("'")
     print(f"[SEARCH] Querying DuckDuckGo: {query}") # Log the intent

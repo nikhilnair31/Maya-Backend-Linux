@@ -1,3 +1,5 @@
+# main.py
+
 import os
 import re
 import json
@@ -13,7 +15,7 @@ from dotenv import load_dotenv
 from transformers import pipeline
 from fastapi.responses import FileResponse
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from tools import web_search, GoveeController
+from tools import WebSearcher, GoveeController, PresenceScanner
 
 # Configuration
 load_dotenv()
@@ -28,6 +30,15 @@ DEVICE_MAP = {
     "KITCHEN LIGHT 2": os.getenv("ID_KITCHEN_2"),
     "ALL": "ALL"
 }
+
+# Load User Profile
+PROFILE_PATH = "user_profile.json"
+if os.path.exists(PROFILE_PATH):
+    with open(PROFILE_PATH, "r") as f:
+        USER_PROFILE = json.load(f)
+else:
+    # Fallback if file is missing
+    USER_PROFILE = {"name": "User", "location": "Unknown", "interests": [], "preferences": ""}
 
 app = FastAPI()
 chat_history = []
@@ -72,7 +83,7 @@ async def process_input(
     global chat_history
     prompt = ""
 
-    # 1. Input Handling
+    # 0. Input Handling
     if audio_file:
         audio_path = f"{TEMP_DIR}/{uuid.uuid4()}_{audio_file.filename}"
         with open(audio_path, "wb") as buffer:
@@ -87,6 +98,15 @@ async def process_input(
         prompt = text_input
     else:
         raise HTTPException(status_code=400, detail="No input")
+    
+    # 1. Get user data
+    # Run this now so we can use it in Step 3 and Step 4
+    is_home = PresenceScanner.is_user_home()
+    # Dynamically build profile string from ANY keys in the JSON
+    profile_parts = [f"{k.capitalize()}: {v}" for k, v in USER_PROFILE.items() if v]
+    profile_parts.append(f"Current Status: {'At Home' if is_home else 'Away'}")
+    profile_summary = " | ".join(profile_parts)
+    # Chat history stuff
     chat_history.append(f"User: {prompt}")
     chat_history = chat_history[-6:]
     history_context = "\n".join(chat_history)
@@ -196,6 +216,7 @@ async def process_input(
             context = "API Call failed"
     elif "GENERAL_QUESTION" in cat_resp:
         rewrite_prompt = (
+            f"User Profile Summary: {profile_summary}.\n"
             f"Conversation History:\n{history_context}\n\n"
             f"User's new question: {prompt}\n"
             f"Rewrite this question into a standalone search engine query "
@@ -217,7 +238,7 @@ async def process_input(
 
         print(f"[ACTION] Searching for expanded query: {search_query_resp}")
         
-        search_results = web_search(search_query_resp)
+        search_results = WebSearcher.search(search_query_resp)
         context = f"Search Results: {search_results}"
     else:
         # DEFAULT / CONVERSATIONAL branch
@@ -229,30 +250,33 @@ async def process_input(
         is_search = "Search Results:" in context
         is_light = "SUCCESS:" in context
 
-        # SYSTEM PERSONA
-        system_rules = "You are Maya. Answer briefly and directly. Do not introduce yourself or use filler phrases."
+        # 2. Define Persona using the dynamic summary
+        system_rules = (
+            f"Role: You are Maya, a smart home assistant. "
+            f"User Context: {profile_summary}. "
+            f"Persona Style: {USER_PROFILE.get('preferences', 'Concise')}. "
+            f"Instruction: Address the user as {USER_PROFILE.get('nickname', 'User')}."
+        )
         
         if is_light:
             final_prompt = (
                 f"{system_rules}\n"
                 f"Context: {context}\n"
-                f"Task: Give a very short, confident confirmation of the action. "
-                f"Max 3 words. No questions. Be witty but certain."
+                f"Task: Give a very short confirmation of the light action. "
+                f"Max 5 words. Use your specific persona/style."
             )
         elif is_search:
             final_prompt = (
                 f"{system_rules}\n"
                 f"Search Data: {context}\n"
                 f"User Asked: {prompt}\n"
-                f"Task: Summarize the news naturally. Don't cite links or say 'The article says'. "
-                f"Keep it under 25 words."
+                f"Task: Summarize the news naturally. Under 25 words."
             )
         else:
             final_prompt = (
                 f"{system_rules}\n"
                 f"User said: {prompt}\n"
-                f"Task: Reply to the user briefly and personably. One short sentence only."
-                f"Never say you are an AI or Qwen. You are Maya."
+                f"Task: Reply briefly. One short sentence only. You are Maya."
             )
         print(f"[DEBUG] final_prompt: {final_prompt}")
 
