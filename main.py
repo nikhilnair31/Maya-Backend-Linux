@@ -60,9 +60,15 @@ def clean_header_text(text: str) -> str:
         return ""
     # 1. Remove newlines, tabs, and carriage returns
     clean = text.replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
-    # 2. Use Regex to keep only basic printable ASCII characters (no bullets, no emojis)
+    
+    # 2. Force encoding to ASCII and ignore errors to strip emojis/special chars
+    # This is the most reliable way to satisfy h11/uvicorn header requirements
+    clean = clean.encode("ascii", "ignore").decode("ascii")
+    
+    # 3. Use Regex to keep only basic printable characters just in case
     clean = re.sub(r'[^\x20-\x7E]', '', clean)
-    # 3. Truncate for header safety
+    
+    # 4. Truncate for header safety
     return (clean[:100] + "..") if len(clean) > 100 else clean
 
 def remove_file(path: str):
@@ -169,20 +175,24 @@ async def process_input(
         devices_list = ", ".join(LightsController.DEVICES.keys())
 
         decision_prompt = f"""<|im_start|>system
-            You are a home automation validator. 
-            Goal: Determine if the user wants to CHANGE power or brightness.
+            You are a smart home lighting controller.
+            
+            # Goals:
+            - Identify the ACTION (ON or OFF).
+            - Identify the TARGET ({devices_list} or ALL).
+            - Identify BRIGHTNESS (0-100) if a number is mentioned.
 
             # Rules:
-            1. Use "action": "OFF" for commands like "turn off", "shutdown", "lights out", or "go dark".
-            2. Use "action": "ON" for "turn on", "dim to", "set to", or brightness changes.
-            3. If the user describes a state (e.g., "it is dark in here"), output "NO_ACTION".
-            4. Available targets: {devices_list}, ALL.
+            1. If the user mentions a number (e.g., "100", "set to 50", "20%"), include it as "brightness": <number>.
+            2. If no number is mentioned, do NOT include the brightness key.
+            3. "action": "OFF" is only for turning completely off. 
+            4. "action": "ON" is for turning on OR changing brightness.
+            5. Return ONLY valid JSON.
 
             # Examples:
-            User: "Turn on the kitchen" -> {{"action": "ON", "target": "KITCHEN LIGHT 1"}}
-            User: "all lights off" -> {{"action": "OFF", "target": "ALL"}}
-            User: "Dim everything to 20%" -> {{"action": "ON", "brightness": 20, "target": "ALL"}}
-            User: "standing lamp off" -> {{"action": "OFF", "target": "STANDING LAMP"}}
+            User: "All lights 100" -> {{"action": "ON", "target": "ALL", "brightness": 100}}
+            User: "kitchen off" -> {{"action": "OFF", "target": "KITCHEN LIGHT 1"}}
+            User: "dim ambient lamp to 5" -> {{"action": "ON", "target": "AMBIENT LAMP 1", "brightness": 5}}
             <|im_end|>
             <|im_start|>user
             {prompt}
