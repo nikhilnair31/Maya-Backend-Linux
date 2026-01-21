@@ -181,18 +181,25 @@ async def process_input(
             - Identify the ACTION (ON or OFF).
             - Identify the TARGET ({devices_list} or ALL).
             - Identify BRIGHTNESS (0-100) if a number is mentioned.
+            - Identify COLOR_TEMP (2000-6500) if a number is mentioned.
 
             # Rules:
             1. If the user mentions a number (e.g., "100", "set to 50", "20%"), include it as "brightness": <number>.
             2. If no number is mentioned, do NOT include the brightness key.
             3. "action": "OFF" is only for turning completely off. 
             4. "action": "ON" is for turning on OR changing brightness.
-            5. Return ONLY valid JSON.
+            5. "color_temp" should be an integer in Kelvin if implied.
+            6. Return ONLY valid JSON.
+
+            # Special Modes:
+            - "full blast" / "max": action "ON", brightness 100, color_temp 4000.
+            - "back to normal" / "reset": action "ON", brightness 50, color_temp 2700.
 
             # Examples:
             User: "All lights 100" -> {{"action": "ON", "target": "ALL", "brightness": 100}}
             User: "kitchen off" -> {{"action": "OFF", "target": "KITCHEN LIGHT 1"}}
             User: "dim ambient lamp to 5" -> {{"action": "ON", "target": "AMBIENT LAMP 1", "brightness": 5}}
+            User: "max blast all" -> {{"action": "ON", "target": "ALL", "brightness": 100, "brightness": 4000}}
             <|im_end|>
             <|im_start|>user
             {prompt}
@@ -237,15 +244,25 @@ async def process_input(
                     action_str = params.get("action", "OFF").upper()
                     target = params.get("target", "ALL").upper()
                     brightness_val = params.get("brightness") # May be None
+                    color_temp_val = params.get("color_temp") # May be None
 
                     action_bool = (action_str == "ON")
                     
                     # Pass brightness to the controller
-                    success = LightsController.set_light(action_bool, target, brightness=brightness_val)
+                    success = LightsController.set_light(
+                        action_bool, 
+                        target, 
+                        brightness=brightness_val, 
+                        color_temp=color_temp_val
+                    )
                     
                     if success:
                         if brightness_val:
                             context = f"SUCCESS: {target} set to {brightness_val}% brightness"
+                        elif color_temp_val == 4000:
+                            context = "SUCCESS: Full blast mode activated."
+                        elif color_temp_val == 2700:
+                            context = "SUCCESS: Lights reset to normal."
                         else:
                             context = f"SUCCESS: {target} turned {action_str}"
                     else:

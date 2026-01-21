@@ -7,85 +7,78 @@ import uuid
 import socket
 import requests
 import subprocess
+import platform
+import logging
+import shutil
 from ddgs import DDGS
 from statistics import mean
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
+
+# Try to import scapy for Layer 2 discovery
+try:
+    from scapy.all import arping
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
 
 load_dotenv()
 
 class PresenceScanner:
     @staticmethod
     def is_user_home():
-        PHONE_NAME = os.getenv("PHONE_NAME")
-        PHONE_STATIC_IP = os.getenv("PHONE_STATIC_IP")
-        print(f"\n[DEBUG] Starting presence check for {PHONE_NAME}...")
+        """
+        Main entry point for checking user presence using ARP, ICMP, and Tailscale.
+        """
+        WIFI_IP = os.getenv("PHONE_STATIC_IP")
+        TS_IP = os.getenv("PHONE_TAILSCALE_IP") or os.getenv("PHONE_NAME")
+        INTERFACE = os.getenv("NETWORK_INTERFACE") # e.g., 'eth0' or 'wlan0'
+        
+        # 1. Try ARP Scan (Layer 2 - Most reliable for local)
+        if SCAPY_AVAILABLE and WIFI_IP:
+            try:
+                # Use specified interface if available to avoid Scapy routing issues
+                ans, _ = arping(WIFI_IP, iface=INTERFACE, timeout=1, verbose=0) if INTERFACE \
+                    else arping(WIFI_IP, timeout=1, verbose=0)
+                if len(ans) > 0:
+                    print(f"[PRESENCE] Home via ARP ({WIFI_IP})")
+                    return True
+            except Exception as e:
+                print(f"[DEBUG] ARP Error: {e}")
 
-        # --- METHOD A: TAILSCALE CHECK ---
-        try:
-            print(f"[DEBUG] Checking Tailscale status via CLI...")
-            result = subprocess.run(
-                ["tailscale", "status", "--json"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                peers = data.get("Peer", {})
-                
-                for peer_id, info in peers.items():
-                    dns_name = info.get("DNSName", "").lower()
-                    if PHONE_NAME.lower() in dns_name:
-                        online = info.get("Online", False)
-                        # Relay 'iad' (Dulles) means you are connecting via a TS DERP server (Away)
-                        # An empty relay string OR "direct" usually means a local/p2p connection.
-                        relay = info.get("Relay", "")
-                        cur_addr = info.get("CurAddr", "")
-
-                        print(f"[DEBUG] Tailscale Match: {dns_name}")
-                        print(f"[DEBUG] - Online: {online} | Relay: '{relay}'")
-                        print(f"[DEBUG] - CurAddr: {cur_addr}")
-
-                        if online:
-                            # 1. Check if the current address is your local subnet
-                            if PHONE_STATIC_IP and PHONE_STATIC_IP in cur_addr:
-                                print(f"[PRESENCE] Home via Tailscale (Local IP Match)")
-                                return True
-                            
-                            # 2. If online and NO relay is used, it's a direct connection.
-                            # Usually, if you are at home, Tailscale identifies a "direct" path.
-                            if relay == "":
-                                print("[PRESENCE] Home via Tailscale (Direct/No Relay)")
-                                return True
-                            
-                print(f"[DEBUG] Tailscale indicates device is Remote/Relayed.")
-        except Exception as e:
-            print(f"[DEBUG] Tailscale check error: {e}")
-
-        # --- METHOD B: LOCAL ARPING FALLBACK ---
-        # Increased count and timeout because phones sleep their network chips
-        print(f"[DEBUG] Falling back to ARPING for {PHONE_STATIC_IP}...")
-        try:
-            # -c 3: Send 3 packets to wake up the device
-            # -w 2: Wait 2 seconds
-            arping_cmd = [
-                "sudo",
-                "arping",
-                "-c",
-                "3",
-                "-w",
-                "2",
-                PHONE_STATIC_IP,
-            ]
-            arping_result = subprocess.run(arping_cmd, capture_output=True)
-
-            if arping_result.returncode == 0:
-                print(f"[PRESENCE] Home via Local ARPING ({PHONE_STATIC_IP})")
+        # 2. Try Standard Ping (Layer 3)
+        if WIFI_IP:
+            is_windows = platform.system().lower() == "windows"
+            param = "-n" if is_windows else "-c"
+            timeout_param = "-w" if is_windows else "-W"
+            timeout_val = "1000" if is_windows else "1"
+            
+            # Wake up the radio first
+            subprocess.run(["ping", param, "1", timeout_param, timeout_val, WIFI_IP], 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # Actual check
+            cmd = ["ping", param, "1", timeout_param, timeout_val, WIFI_IP]
+            if subprocess.run(cmd, stdout=subprocess.DEVNULL).returncode == 0:
+                print(f"[PRESENCE] Home via ICMP Ping ({WIFI_IP})")
                 return True
-        except Exception as e:
-            print(f"[DEBUG] ARPING command error: {e}")
+
+        # 3. Try Tailscale Ping (The 'Sleep-breaker')
+        if TS_IP and shutil.which("tailscale"):
+            # tailscale ping is excellent for waking up mobile devices
+            ts_cmd = ["tailscale", "ping", "-c", "1", "--timeout", "2s", TS_IP]
+            try:
+                ts_result = subprocess.run(ts_cmd, capture_output=True, text=True)
+                if ts_result.returncode == 0 and "pong" in ts_result.stdout.lower():
+                    # Check if it's a direct connection to confirm 'Home' status
+                    # If you want to be home even via DERP (Relay), remove 'via DERP' check
+                    if "via DERP" not in ts_result.stdout:
+                        print(f"[PRESENCE] Home via Tailscale Direct ({TS_IP})")
+                        return True
+                    else:
+                        print(f"[DEBUG] User reachable via Tailscale Relay (Away)")
+            except Exception as e:
+                print(f"[DEBUG] Tailscale Ping Error: {e}")
 
         print("[PRESENCE] User appears to be AWAY.")
         return False
@@ -106,61 +99,46 @@ class LightsController:
 
     @staticmethod
     def set_light(
-        state: bool, target_string: str, brightness: int = None
+        state: bool, target_string: str, brightness: int = None, color_temp: int = None
     ) -> bool:
-        """
-        Sets the light power state or brightness for a device or ALL devices.
-        :param state: True for 'on', False for 'off'
-        :param target_string: Key from the DEVICES dictionary or 'ALL'
-        :param brightness: Optional integer 1-100
-        :return: Boolean indicating if all operations were successful
-        """
         target_upper = target_string.upper()
-
         if target_upper == "ALL":
             targets = list(LightsController.DEVICES.keys())
         elif target_upper in LightsController.DEVICES:
             targets = [target_upper]
         else:
-            print(f"Device '{target_string}' not found.")
             return False
 
         overall_success = True
-
         for device_key in targets:
             device_id, sku = LightsController.DEVICES[device_key]
-
             if not device_id or not sku:
-                print(f"Skipping {device_key}: Missing ID or SKU in .env")
                 overall_success = False
                 continue
 
-            # Send Power Command
+            # 1. Power State
             success = LightsController._send_command(
-                device_id,
-                sku,
-                "powerSwitch",
-                1 if state else 0,
-                "devices.capabilities.on_off",
+                device_id, sku, "powerSwitch", 1 if state else 0, "devices.capabilities.on_off"
             )
 
-            # Send Brightness Command if state is True and brightness is provided
+            # 2. Brightness
             if success and state and brightness is not None:
-                # Ensure brightness is within 1-100 range
                 val = max(1, min(100, brightness))
                 success = LightsController._send_command(
-                    device_id,
-                    sku,
-                    "brightness",
-                    val,
-                    "devices.capabilities.range",
+                    device_id, sku, "brightness", val, "devices.capabilities.range"
+                )
+
+            # 3. Color Temperature (Added Logic)
+            if success and state and color_temp is not None:
+                # Govee API usually expects Kelvin (2000-9000 depending on model)
+                success = LightsController._send_command(
+                    device_id, sku, "colorTemperatureK", color_temp, "devices.capabilities.color_setting"
                 )
 
             if not success:
                 overall_success = False
-
             if target_upper == "ALL":
-                time.sleep(0.2)  # Slightly longer sleep for multiple commands
+                time.sleep(0.2)
 
         return overall_success
 
