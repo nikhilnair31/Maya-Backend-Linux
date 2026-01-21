@@ -104,7 +104,8 @@ async def process_input(
         prompt = text_input
     else:
         raise HTTPException(status_code=400, detail="No input")
-    
+    print(f"[DEBUG] User input: {prompt}")
+
     # 1. GATHER ALL CONTEXT (Always happens)
     is_home = PresenceScanner.is_user_home()
     
@@ -167,7 +168,8 @@ async def process_input(
         ).json().get("response", "").strip().upper()
     except Exception:
         cat_resp = "CONVERSATIONAL"
-    
+    print(f"[ACTION] Category is: {cat_resp}")
+
     # 3. EXECUTION BRANCHES
     context = ""
     if "LIGHT_COMMAND" in cat_resp:
@@ -297,10 +299,10 @@ async def process_input(
                 },
             ).json().get("response", "").strip().replace('"', '')
         except Exception:
+            print(f"[ERROR] Rewrite failed: {e}")
             search_query_resp = prompt # Fallback to original
 
         print(f"[ACTION] Searching for expanded query: {search_query_resp}")
-        
         search_results = WebSearcher.search(search_query_resp)
         context = f"Search Results: {search_results}"
     else:

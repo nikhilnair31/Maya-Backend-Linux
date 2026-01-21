@@ -44,7 +44,7 @@ class PresenceScanner:
                     print(f"[PRESENCE] Home via ARP ({WIFI_IP})")
                     return True
             except Exception as e:
-                print(f"[DEBUG] ARP Error: {e}")
+                print(f"[PRESENCE] ARP Error: {e}")
 
         # 2. Try Standard Ping (Layer 3)
         if WIFI_IP:
@@ -76,9 +76,9 @@ class PresenceScanner:
                         print(f"[PRESENCE] Home via Tailscale Direct ({TS_IP})")
                         return True
                     else:
-                        print(f"[DEBUG] User reachable via Tailscale Relay (Away)")
+                        print(f"[PRESENCE] User reachable via Tailscale Relay (Away)")
             except Exception as e:
-                print(f"[DEBUG] Tailscale Ping Error: {e}")
+                print(f"[PRESENCE] Tailscale Ping Error: {e}")
 
         print("[PRESENCE] User appears to be AWAY.")
         return False
@@ -106,7 +106,7 @@ class LightsController:
             print(f"Device key '{device_key}' not found in configuration.")
             return None
 
-        print(f"Fetching state for {device_key} ({device_id})...")
+        # print(f"[LIGHTS] Fetching state for {device_key} ({device_id})...")
         
         endpoint = f"{LightsController.BASE_URL}/router/api/v1/device/state"
         headers = {
@@ -125,7 +125,7 @@ class LightsController:
 
             if resp_data.get("code") != 200:
                 print(
-                    f"Govee API error for {device_key}: {resp_data.get('message', 'Unknown Error')}"
+                    f"[LIGHTS] Govee API error for {device_key}: {resp_data.get('message', 'Unknown Error')}"
                 )
                 return None
 
@@ -146,14 +146,14 @@ class LightsController:
                 elif inst == "colorRgb":
                     state["color_rgb"] = val
 
-            print(f"Successfully retrieved state for {device_key}: {state}")
+            # print(f"[LIGHTS] Successfully retrieved state for {device_key}: {state}")
             return state
 
         except requests.exceptions.RequestException as e:
-            print(f"Network error fetching state for {device_key}: {e}")
+            # print(f"[LIGHTS] Network error fetching state for {device_key}: {e}")
             return None
         except Exception as e:
-            print(f"Unexpected error fetching state for {device_key}: {e}")
+            # print(f"[LIGHTS] Unexpected error fetching state for {device_key}: {e}")
             return None
 
     @staticmethod
@@ -175,20 +175,31 @@ class LightsController:
             snapshot = json.load(f)
         
         for name, state in snapshot.items():
-            # Restore Power
-            LightsController.set_light(state["power"] == 1, name)
-            if state["power"] == 1:
-                # Restore Brightness
-                LightsController.set_light(True, name, brightness=state["brightness"])
-                # Restore Color (Kelvin takes priority if present)
-                if state.get("color_temp"):
-                    LightsController.set_light(True, name, color_temp=state["color_temp"])
-            time.sleep(0.2)
+            # 1. Restore Brightness (Safely)
+            brightness = state.get("brightness", 100)
+            
+            # 2. Extract values and check specifically against None
+            # This ensures that even if color_temp is 0, we handle it correctly
+            temp = state.get("color_temp")
+            rgb = state.get("color_rgb")
+
+            # 3. Restore logic
+            if temp is not None and temp > 0:
+                # If we have a valid temperature, use it
+                LightsController.set_light(True, name, brightness=brightness, color_temp=temp)
+            elif rgb is not None and rgb > 0:
+                # If temp is 0/None but we have an RGB value, use that
+                LightsController.set_light(True, name, brightness=brightness, color=rgb)
+            else:
+                # Fallback to just power/brightness if no color info exists
+                LightsController.set_light(True, name, brightness=brightness)
+
+            time.sleep(0.3)
         return True
 
     @staticmethod
-    def set_light(state: bool, target_string: str, brightness: int = None, color_temp: int = None) -> bool:
-        target_upper = target_string.upper()
+    def set_light(state: bool, target: str, brightness: int = None, color_temp: int = None, color: int = None) -> bool:
+        target_upper = target.upper()
         targets = [target_upper] if target_upper in LightsController.DEVICES else (list(LightsController.DEVICES.keys()) if target_upper == "ALL" else [])
         
         overall_success = True
@@ -202,6 +213,8 @@ class LightsController:
             # Temp
             if success and state and color_temp is not None:
                 success = LightsController._send_command(device_id, sku, "colorTemperatureK", color_temp, "devices.capabilities.color_setting")
+            elif success and state and color is not None:
+                success = LightsController._send_command(device_id, sku, "colorRgb", color, "devices.capabilities.color_setting")
             if not success: overall_success = False
         return overall_success
 
@@ -209,10 +222,17 @@ class LightsController:
     def _send_command(device_id, sku, instance, value, cap_type):
         endpoint = f"{LightsController.BASE_URL}/router/api/v1/device/control"
         payload = {"requestId": str(uuid.uuid4()), "payload": {"sku": sku, "device": device_id, "capability": {"type": cap_type, "instance": instance, "value": value}}}
+        print(f"[LIGHTS DEBUG] payload: {payload}")
         try:
             res = requests.post(endpoint, headers={"Govee-API-Key": LightsController.API_KEY}, json=payload, timeout=10)
-            return res.json().get("code") == 200
-        except: return False
+            json_res = res.json()
+            print(f"[LIGHTS DEBUG] json_res: {json_res}")
+            if json_res.get("code") != 200:
+                print(f"[LIGHTS ERROR] Govee API rejected command: {json_res}")
+            return json_res.get("code") == 200
+        except Exception as e: 
+            print(f"[LIGHTS ERROR] Network/Request failed: {e}")
+            return False
 
 class WebSearcher:
     @staticmethod
@@ -249,19 +269,13 @@ class WeatherManager:
 
     @staticmethod
     def get_summary(date_str: str = None) -> str:
-        """
-        Fetches weather. 
-        :param date_str: Format 'YYYY-MM-DD'. If None, fetches current forecast.
-        """
-        # Determine if we use forecast or history endpoint
-        # Default to forecast for today/tomorrow
         mode = "forecast"
         if date_str:
-            print(f"[DEBUG] Fetching weather for {WeatherManager.LOCATION} on {date_str}")
+            print(f"[WEATHER] Fetching weather for {WeatherManager.LOCATION} on {date_str}")
             # If the date is in the past, you'd use "history.json" (requires paid plan usually)
             # For simplicity with free tier, we use forecast.json and 'days' or 'dt'
-        else:
-            print(f"[DEBUG] Fetching current weather for {WeatherManager.LOCATION}")
+        # else:
+        #     print(f"[WEATHER] Fetching current weather for {WeatherManager.LOCATION}")
 
         if not WeatherManager.API_KEY:
             return "Weather Error: Missing API Key"
@@ -300,7 +314,7 @@ class WeatherManager:
                 f"Conditions: {cond} | Avg: {avg_temp}°C (H:{high_c} L:{low_c}) | "
                 f"Rain: {rain_chance}% | Sunset: {sunset_time}"
             )
-            print(f"[DEBUG] Weather Result: {summary}")
+            print(f"[WEATHER] Weather Result: {summary}")
             return summary
             
         except Exception as e:

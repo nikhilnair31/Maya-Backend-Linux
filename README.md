@@ -3,12 +3,13 @@
 - This is just the backend code
 
 ## To-Do
+- Fix the light color/blast/reset loop to use router model
+- Add routines
 - Add ability to set reminders
     - Add to calendar
     - Announce at time
 - Add ability to set timers
 - Add prescence in room check
-- Add routines
 
 ## Tests
 ### Speed Test
