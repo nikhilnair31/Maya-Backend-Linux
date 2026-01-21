@@ -86,8 +86,8 @@ class PresenceScanner:
 class LightsController:
     API_KEY = os.getenv("GOVEE_API_KEY")
     BASE_URL = "https://openapi.api.govee.com"
+    STATE_FILE = "lights_snapshot.json"
 
-    # Centralized Device Configuration
     DEVICES = {
         "AMBIENT LAMP 1": (os.getenv("ID_AMBIENT_1"), os.getenv("GOVEE_BULB_MODEL")),
         "AMBIENT LAMP 2": (os.getenv("ID_AMBIENT_2"), os.getenv("GOVEE_BULB_MODEL")),
@@ -96,92 +96,123 @@ class LightsController:
         "KITCHEN LIGHT 2": (os.getenv("ID_KITCHEN_2"), os.getenv("GOVEE_BULB_MODEL")),
         "CEILING LIGHT": (os.getenv("ID_CEILING"), os.getenv("MODEL_CEILING")),
     }
-
+    
     @staticmethod
-    def set_light(
-        state: bool, target_string: str, brightness: int = None, color_temp: int = None
-    ) -> bool:
-        target_upper = target_string.upper()
-        if target_upper == "ALL":
-            targets = list(LightsController.DEVICES.keys())
-        elif target_upper in LightsController.DEVICES:
-            targets = [target_upper]
-        else:
-            return False
+    def get_device_state(device_key: str):
+        """Fetches current state of a device from Govee API."""
+        device_id, sku = LightsController.DEVICES.get(device_key, (None, None))
+        
+        if not device_id:
+            print(f"Device key '{device_key}' not found in configuration.")
+            return None
 
-        overall_success = True
-        for device_key in targets:
-            device_id, sku = LightsController.DEVICES[device_key]
-            if not device_id or not sku:
-                overall_success = False
-                continue
-
-            # 1. Power State
-            success = LightsController._send_command(
-                device_id, sku, "powerSwitch", 1 if state else 0, "devices.capabilities.on_off"
-            )
-
-            # 2. Brightness
-            if success and state and brightness is not None:
-                val = max(1, min(100, brightness))
-                success = LightsController._send_command(
-                    device_id, sku, "brightness", val, "devices.capabilities.range"
-                )
-
-            # 3. Color Temperature (Added Logic)
-            if success and state and color_temp is not None:
-                # Govee API usually expects Kelvin (2000-9000 depending on model)
-                success = LightsController._send_command(
-                    device_id, sku, "colorTemperatureK", color_temp, "devices.capabilities.color_setting"
-                )
-
-            if not success:
-                overall_success = False
-            if target_upper == "ALL":
-                time.sleep(0.2)
-
-        return overall_success
-
-    @staticmethod
-    def _send_command(
-        device_id: str,
-        sku: str,
-        instance: str,
-        value: any,
-        cap_type: str,
-    ) -> bool:
-        """Internal helper to send the POST request to Govee."""
-        endpoint = f"{LightsController.BASE_URL}/router/api/v1/device/control"
+        print(f"Fetching state for {device_key} ({device_id})...")
+        
+        endpoint = f"{LightsController.BASE_URL}/router/api/v1/device/state"
         headers = {
             "Content-Type": "application/json",
             "Govee-API-Key": LightsController.API_KEY,
         }
         payload = {
             "requestId": str(uuid.uuid4()),
-            "payload": {
-                "sku": sku,
-                "device": device_id,
-                "capability": {
-                    "type": cap_type,
-                    "instance": instance,
-                    "value": value,
-                },
-            },
+            "payload": {"sku": sku, "device": device_id},
         }
 
         try:
-            response = requests.post(
-                endpoint, headers=headers, json=payload, timeout=10
-            )
-            data = response.json()
-            if data.get("code") == 200:
-                return True
-            else:
-                print(f"API Error for {device_id} ({instance}): {data.get('message')}")
-                return False
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=10)
+            response.raise_for_status()
+            resp_data = response.json()
+
+            if resp_data.get("code") != 200:
+                print(
+                    f"Govee API error for {device_key}: {resp_data.get('message', 'Unknown Error')}"
+                )
+                return None
+
+            caps = resp_data.get("payload", {}).get("capabilities", [])
+            state = {
+                "brightness": 50,
+                "color_temp": 2700,
+                "color_rgb": None,
+            }
+
+            for cap in caps:
+                inst = cap.get("instance")
+                val = cap.get("state", {}).get("value")
+                if inst == "brightness":
+                    state["brightness"] = val
+                elif inst == "colorTemperatureK":
+                    state["color_temp"] = val
+                elif inst == "colorRgb":
+                    state["color_rgb"] = val
+
+            print(f"Successfully retrieved state for {device_key}: {state}")
+            return state
+
+        except requests.exceptions.RequestException as e:
+            print(f"Network error fetching state for {device_key}: {e}")
+            return None
         except Exception as e:
-            print(f"Request failed for {device_id}: {e}")
-            return False
+            print(f"Unexpected error fetching state for {device_key}: {e}")
+            return None
+
+    @staticmethod
+    def save_all_states():
+        """Snapshots all lights to a JSON file."""
+        snapshot = {}
+        for name in LightsController.DEVICES:
+            state = LightsController.get_device_state(name)
+            if state: snapshot[name] = state
+        with open(LightsController.STATE_FILE, "w") as f:
+            json.dump(snapshot, f)
+        return True
+
+    @staticmethod
+    def restore_all_states():
+        """Restores lights from the JSON file."""
+        if not os.path.exists(LightsController.STATE_FILE): return False
+        with open(LightsController.STATE_FILE, "r") as f:
+            snapshot = json.load(f)
+        
+        for name, state in snapshot.items():
+            # Restore Power
+            LightsController.set_light(state["power"] == 1, name)
+            if state["power"] == 1:
+                # Restore Brightness
+                LightsController.set_light(True, name, brightness=state["brightness"])
+                # Restore Color (Kelvin takes priority if present)
+                if state.get("color_temp"):
+                    LightsController.set_light(True, name, color_temp=state["color_temp"])
+            time.sleep(0.2)
+        return True
+
+    @staticmethod
+    def set_light(state: bool, target_string: str, brightness: int = None, color_temp: int = None) -> bool:
+        target_upper = target_string.upper()
+        targets = [target_upper] if target_upper in LightsController.DEVICES else (list(LightsController.DEVICES.keys()) if target_upper == "ALL" else [])
+        
+        overall_success = True
+        for device_key in targets:
+            device_id, sku = LightsController.DEVICES[device_key]
+            # Power
+            success = LightsController._send_command(device_id, sku, "powerSwitch", 1 if state else 0, "devices.capabilities.on_off")
+            # Brightness
+            if success and state and brightness is not None:
+                success = LightsController._send_command(device_id, sku, "brightness", max(1, min(100, brightness)), "devices.capabilities.range")
+            # Temp
+            if success and state and color_temp is not None:
+                success = LightsController._send_command(device_id, sku, "colorTemperatureK", color_temp, "devices.capabilities.color_setting")
+            if not success: overall_success = False
+        return overall_success
+
+    @staticmethod
+    def _send_command(device_id, sku, instance, value, cap_type):
+        endpoint = f"{LightsController.BASE_URL}/router/api/v1/device/control"
+        payload = {"requestId": str(uuid.uuid4()), "payload": {"sku": sku, "device": device_id, "capability": {"type": cap_type, "instance": instance, "value": value}}}
+        try:
+            res = requests.post(endpoint, headers={"Govee-API-Key": LightsController.API_KEY}, json=payload, timeout=10)
+            return res.json().get("code") == 200
+        except: return False
 
 class WebSearcher:
     @staticmethod

@@ -26,6 +26,8 @@
     - Maya: <5s
 
 ## Done
+- Add light color reset
+- Added light blast
 - Add light brightness control
 - Add weather tool
 - Add user profile

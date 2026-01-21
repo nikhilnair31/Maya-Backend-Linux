@@ -171,111 +171,112 @@ async def process_input(
     # 3. EXECUTION BRANCHES
     context = ""
     if "LIGHT_COMMAND" in cat_resp:
-        # Optimal Router Prompt for Qwen 2.5 3B
-        devices_list = ", ".join(LightsController.DEVICES.keys())
-
-        decision_prompt = f"""<|im_start|>system
-            You are a smart home lighting controller.
-            
-            # Goals:
-            - Identify the ACTION (ON or OFF).
-            - Identify the TARGET ({devices_list} or ALL).
-            - Identify BRIGHTNESS (0-100) if a number is mentioned.
-            - Identify COLOR_TEMP (2000-6500) if a number is mentioned.
-
-            # Rules:
-            1. If the user mentions a number (e.g., "100", "set to 50", "20%"), include it as "brightness": <number>.
-            2. If no number is mentioned, do NOT include the brightness key.
-            3. "action": "OFF" is only for turning completely off. 
-            4. "action": "ON" is for turning on OR changing brightness.
-            5. "color_temp" should be an integer in Kelvin if implied.
-            6. Return ONLY valid JSON.
-
-            # Special Modes:
-            - "full blast" / "max": action "ON", brightness 100, color_temp 4000.
-            - "back to normal" / "reset": action "ON", brightness 50, color_temp 2700.
-
-            # Examples:
-            User: "All lights 100" -> {{"action": "ON", "target": "ALL", "brightness": 100}}
-            User: "kitchen off" -> {{"action": "OFF", "target": "KITCHEN LIGHT 1"}}
-            User: "dim ambient lamp to 5" -> {{"action": "ON", "target": "AMBIENT LAMP 1", "brightness": 5}}
-            User: "max blast all" -> {{"action": "ON", "target": "ALL", "brightness": 100, "brightness": 4000}}
-            <|im_end|>
-            <|im_start|>user
-            {prompt}
-            <|im_end|>
-            <|im_start|>assistant
-        """
-        print(f"[DEBUG] Input Prompt: {decision_prompt}")
+        # Check for Snapshot/Restore keywords before calling LLM router
+        lower_prompt = prompt.lower()
         
-        try:
-            resp = requests.post(
-                OLLAMA_ENDPOINT,
-                json={
-                    "model": MODEL_NAME, 
-                    "prompt": decision_prompt, 
-                    "stream": False, 
-                    "options": {"temperature": 0, "stop": ["<|im_end|>", "</tool_call>"]}
-                },
-            ).json()
-            
-            decision_resp = resp.get("response", "").strip()
-            print(f"[DEBUG] Raw Router Output: {decision_resp}")
+        if any(x in lower_prompt for x in ["reset", "normal", "back to how it was"]):
+            success = LightsController.restore_all_states()
+            context = "SUCCESS: Lights restored to previous state." if success else "FAILED: No snapshot found."
         
-            # --- ADD THIS CHECK ---
-            if "NO_ACTION" in decision_resp or "{" not in decision_resp:
-                print("[DEBUG] False positive light command detected. Diverting to conversational.")
-                cat_resp = "CONVERSATIONAL" # Force it into the chat branch instead
-            else:
-                try:
-                    # 1. Strip Markdown and XML tags
-                    json_clean = decision_resp.replace("<tool_call>", "").replace("</tool_call>", "")
-                    json_clean = json_clean.replace("```json", "").replace("```", "").strip()
-                    
-                    tool_data = json.loads(json_clean)
-                    
-                    # 2. Flexible parameter extraction
-                    # This handles both {"parameters": {"action": "ON"}} AND {"action": "ON"}
-                    if "parameters" in tool_data:
-                        params = tool_data["parameters"]
-                    else:
-                        params = tool_data
+        elif any(x in lower_prompt for x in ["full blast", "maximum", "max light"]):
+            # 1. Save current state first!
+            LightsController.save_all_states()
+            # 2. Set to Max
+            success = LightsController.set_light(True, "ALL", brightness=100, color_temp=4000)
+            context = "SUCCESS: Snapshot saved and full blast activated." if success else "FAILED: Couldn't reach lights."
+            
+        else:
+            # Regular LLM Routing for specific lights
+            devices_list = ", ".join(LightsController.DEVICES.keys())
+            decision_prompt = f"""<|im_start|>system
+                You are a smart home lighting controller.
+                
+                # Goals:
+                - Identify the ACTION (ON or OFF).
+                - Identify the TARGET ({devices_list} or ALL).
+                - Identify BRIGHTNESS (0-100) if a number is mentioned.
+
+                # Rules:
+                1. If the user mentions a number (e.g., "100", "set to 50", "20%"), include it as "brightness": <number>.
+                2. If no number is mentioned, do NOT include the brightness key.
+                3. "action": "OFF" is only for turning completely off. 
+                4. "action": "ON" is for turning on OR changing brightness.
+                5. Return ONLY valid JSON.
+
+                # Examples:
+                User: "All lights 100" -> {{"action": "ON", "target": "ALL", "brightness": 100}}
+                User: "kitchen off" -> {{"action": "OFF", "target": "KITCHEN LIGHT 1"}}
+                User: "dim ambient lamp to 5" -> {{"action": "ON", "target": "AMBIENT LAMP 1", "brightness": 5}}
+                <|im_end|>
+                <|im_start|>user
+                {prompt}
+                <|im_end|>
+                <|im_start|>assistant
+            """
+            print(f"[DEBUG] Input Prompt: {decision_prompt}")
+            
+            try:
+                resp = requests.post(
+                    OLLAMA_ENDPOINT,
+                    json={
+                        "model": MODEL_NAME, 
+                        "prompt": decision_prompt, 
+                        "stream": False, 
+                        "options": {"temperature": 0, "stop": ["<|im_end|>", "</tool_call>"]}
+                    },
+                ).json()
+                
+                decision_resp = resp.get("response", "").strip()
+                print(f"[DEBUG] Raw Router Output: {decision_resp}")
+            
+                # --- ADD THIS CHECK ---
+                if "NO_ACTION" in decision_resp or "{" not in decision_resp:
+                    print("[DEBUG] False positive light command detected. Diverting to conversational.")
+                    cat_resp = "CONVERSATIONAL" # Force it into the chat branch instead
+                else:
+                    try:
+                        # 1. Strip Markdown and XML tags
+                        json_clean = decision_resp.replace("<tool_call>", "").replace("</tool_call>", "")
+                        json_clean = json_clean.replace("```json", "").replace("```", "").strip()
                         
-                    action_str = params.get("action", "OFF").upper()
-                    target = params.get("target", "ALL").upper()
-                    brightness_val = params.get("brightness") # May be None
-                    color_temp_val = params.get("color_temp") # May be None
-
-                    action_bool = (action_str == "ON")
-                    
-                    # Pass brightness to the controller
-                    success = LightsController.set_light(
-                        action_bool, 
-                        target, 
-                        brightness=brightness_val, 
-                        color_temp=color_temp_val
-                    )
-                    
-                    if success:
-                        if brightness_val:
-                            context = f"SUCCESS: {target} set to {brightness_val}% brightness"
-                        elif color_temp_val == 4000:
-                            context = "SUCCESS: Full blast mode activated."
-                        elif color_temp_val == 2700:
-                            context = "SUCCESS: Lights reset to normal."
+                        tool_data = json.loads(json_clean)
+                        
+                        # 2. Flexible parameter extraction
+                        # This handles both {"parameters": {"action": "ON"}} AND {"action": "ON"}
+                        if "parameters" in tool_data:
+                            params = tool_data["parameters"]
                         else:
-                            context = f"SUCCESS: {target} turned {action_str}"
-                    else:
-                        context = "FAILED: I couldn't reach the lights."
-                    
-                except Exception as e:
-                    print(f"[ERROR] Parsing failed: {e}")
-                    context = "I couldn't process that light command."
-                    # Don't switch to CONVERSATIONAL here, let it finish with the error context
-            
-        except Exception as e:
-            print(f"[WARN] Routing/Parsing Error: {e}")
-            context = "API Call failed"
+                            params = tool_data
+                            
+                        action_str = params.get("action", "OFF").upper()
+                        target = params.get("target", "ALL").upper()
+                        brightness_val = params.get("brightness") # May be None
+
+                        action_bool = (action_str == "ON")
+                        
+                        # Pass brightness to the controller
+                        success = LightsController.set_light(
+                            action_bool, 
+                            target, 
+                            brightness=brightness_val
+                        )
+                        
+                        if success:
+                            if brightness_val:
+                                context = f"SUCCESS: {target} set to {brightness_val}% brightness"
+                            else:
+                                context = f"SUCCESS: {target} turned {action_str}"
+                        else:
+                            context = "FAILED: I couldn't reach the lights."
+                        
+                    except Exception as e:
+                        print(f"[ERROR] Parsing failed: {e}")
+                        context = "I couldn't process that light command."
+                        # Don't switch to CONVERSATIONAL here, let it finish with the error context
+                
+            except Exception as e:
+                print(f"[WARN] Routing/Parsing Error: {e}")
+                context = "API Call failed"
     elif "GENERAL_QUESTION" in cat_resp:
         rewrite_prompt = (
             f"User Profile Summary: {profile_summary}.\n"
